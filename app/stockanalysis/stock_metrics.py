@@ -5,14 +5,33 @@ from decimal import Decimal
 from typing import List, Dict, Optional, Union
 import numpy as np
 import pytz
-
 import logging
 
 logger = logging.getLogger(__name__)
 
+# 检查QuantStats是否可用
+try:
+	import quantstats as qs
+	
+	HAS_QUANTSTATS = True
+	logger.info("✅ QuantStats库可用，将使用专业算法计算风险指标")
+except ImportError:
+	HAS_QUANTSTATS = False
+	logger.warning("❌ QuantStats库不可用，将使用备用算法。建议安装: pip install quantstats")
+
+# 备用库检查
+try:
+	import empyrical as emp
+	
+	HAS_EMPYRICAL = True
+	logger.info("✅ Empyrical库可用作为备用")
+except ImportError:
+	HAS_EMPYRICAL = False
+	logger.warning("❌ Empyrical库不可用，建议安装: pip install empyrical")
+
 
 class StockMetrics:
-	"""股票分析服务类（高效 Pandas 版本）"""
+	"""股票分析服务类（使用QuantStats优化版本）"""
 	
 	@staticmethod
 	def get_historical_returns(
@@ -21,13 +40,9 @@ class StockMetrics:
 			periods: List[str] = ['1W', 'YTD']
 			) -> Dict[str, Dict[str, float]]:
 		"""
-        获取股票历史收益率（按自然周期计算），基于 Pandas。
-
-        price_df: DataFrame，包含 columns=['stock_symbol', 'datetime', 'close']，datetime 必须是 pd.Timestamp
-        symbols: 股票代码列表
-        periods: 时间周期列表，支持 '1D','1W','2W','1M','3M','6M','1Y','YTD','MTD'
-        返回: { "AAPL": {"1D": 1.23, "1W": 5.67, "1M": 10.12}, ... }
-        """
+		获取股票历史收益率（按自然周期计算），基于 Pandas。
+		保持原有逻辑不变。
+		"""
 		if not symbols or price_df.empty:
 			return {}
 		
@@ -43,7 +58,7 @@ class StockMetrics:
 		
 		# 使用数据中的最新日期作为基准
 		latest_date = trading_days.max()
-		print(f"使用最新数据日期作为基准: {latest_date}")
+		logger.debug(f"使用最新数据日期作为基准: {latest_date}")
 		
 		# 最近收盘价
 		latest_prices = price_df.groupby('stock_symbol')['close'].last()
@@ -110,9 +125,9 @@ class StockMetrics:
 			lookback_days: int = 252
 			) -> Dict[str, any]:
 		"""
-		获取投资组合完整风险指标（带日志输出）
+		获取投资组合完整风险指标（使用QuantStats优化）
 		"""
-		logger.info("开始计算投资组合风险指标...")
+		logger.info("开始计算投资组合风险指标（QuantStats优化版本）...")
 		
 		# 获取每日收益率
 		daily_returns = StockMetrics._get_portfolio_daily_returns(
@@ -120,76 +135,343 @@ class StockMetrics:
 			)
 		logger.debug("每日收益率计算完成，样本数=%d", len(daily_returns))
 		
-		# 获取每日持仓数据
-		daily_positions = StockMetrics._build_daily_positions(
-			transactions_df, price_df
-			)
-		logger.debug("每日持仓构建完成，样本数=%d", len(daily_positions))
-		
-		if daily_returns.empty or daily_positions.empty:
+		if daily_returns.empty:
 			logger.warning("数据为空，返回空指标结果")
 			return StockMetrics._get_empty_metrics()
 		
-		# 1. 夏普比率
-		sharpe_ratio = StockMetrics.get_portfolio_sharpe_ratio(
-			transactions_df, price_df, risk_free_rate, lookback_days
-			)
+		# 确保daily_returns是pandas Series且有DatetimeIndex
+		if not isinstance(daily_returns.index, pd.DatetimeIndex):
+			daily_returns.index = pd.to_datetime(daily_returns.index)
+		
+		# 使用QuantStats计算各项指标
+		sharpe_ratio = StockMetrics.get_portfolio_sharpe_ratio_qs(daily_returns, risk_free_rate)
+		sortino_ratio = StockMetrics.get_portfolio_sortino_ratio_qs(daily_returns, risk_free_rate)
+		max_drawdown_info = StockMetrics.get_portfolio_max_drawdown_qs(daily_returns)
+		volatility = StockMetrics.get_portfolio_volatility_qs(daily_returns)
+		beta = StockMetrics.get_portfolio_beta_qs(daily_returns, benchmark_returns)
+		
+		# 额外的QuantStats指标
+		var_95 = StockMetrics.get_portfolio_var_qs(daily_returns)
+		cvar_95 = StockMetrics.get_portfolio_cvar_qs(daily_returns)
+		calmar_ratio = StockMetrics.get_portfolio_calmar_ratio_qs(daily_returns)
+		
 		logger.info("夏普比率=%.4f", sharpe_ratio)
-		
-		# 2. 索提诺比率
-		sortino_ratio = StockMetrics.get_portfolio_sortino_ratio(
-			transactions_df, price_df, risk_free_rate, lookback_days
-			)
 		logger.info("索提诺比率=%.4f", sortino_ratio)
-		
-		# 3. Beta系数
-		beta = 0.0
-		if benchmark_returns is not None and not benchmark_returns.empty:
-			aligned_data = pd.DataFrame({
-				'portfolio': daily_returns,
-				'benchmark': benchmark_returns
-				}).dropna()
-			
-			if len(aligned_data) >= 50:
-				covariance = np.cov(aligned_data['portfolio'], aligned_data['benchmark'])[0, 1]
-				benchmark_variance = np.var(aligned_data['benchmark'])
-				if benchmark_variance > 0:
-					beta = round(covariance / benchmark_variance, 3)
 		logger.info("Beta系数=%.4f", beta)
-		
-		# 4. 最大回撤
-		drawdown_info = StockMetrics.get_portfolio_max_drawdown(
-			transactions_df, price_df, lookback_days
-			)
-		logger.info("最大回撤=%.2f%%, 持续=%d天",
-		            drawdown_info['max_drawdown'], drawdown_info['duration_days'])
-		
-		# 5. 波动率
-		volatility = StockMetrics.get_portfolio_volatility(
-			transactions_df, price_df, lookback_days
-			)
+		logger.info("最大回撤=%.2f%%", max_drawdown_info['max_drawdown'])
 		logger.info("年化波动率=%.2f%%", volatility)
-		
 		
 		metrics = {
 			'sharpe_ratio': sharpe_ratio,
 			'sortino_ratio': sortino_ratio,
 			'beta': beta,
-			'max_drawdown': drawdown_info['max_drawdown'],
-			'drawdown_start_date': drawdown_info['drawdown_start_date'],
-			'drawdown_end_date': drawdown_info['drawdown_end_date'],
-			'recovery_date': drawdown_info['recovery_date'],
-			'drawdown_duration_days': drawdown_info['duration_days'],
+			'max_drawdown': max_drawdown_info['max_drawdown'],
+			'drawdown_start_date': max_drawdown_info.get('drawdown_start_date'),
+			'drawdown_end_date': max_drawdown_info.get('drawdown_end_date'),
+			'recovery_date': max_drawdown_info.get('recovery_date'),
+			'drawdown_duration_days': max_drawdown_info.get('duration_days', 0),
 			'volatility': volatility,
+			'var_95': var_95,
+			'cvar_95': cvar_95,
+			'calmar_ratio': calmar_ratio,
 			'total_trading_days': len(daily_returns),
-			'latest_update_date': daily_returns.index[-1] if not daily_returns.empty else None
+			'latest_update_date': daily_returns.index[-1] if not daily_returns.empty else None,
+			'calculation_method': 'QuantStats' if HAS_QUANTSTATS else 'Manual'
 			}
 		
-		logger.info("风险指标计算完成，交易日数=%d, 最新数据日期=%s",
-		            metrics['total_trading_days'], metrics['latest_update_date'])
+		logger.info("风险指标计算完成，交易日数=%d, 最新数据日期=%s, 使用方法=%s",
+		            metrics['total_trading_days'], metrics['latest_update_date'], metrics['calculation_method'])
 		
 		return metrics
 	
+	@staticmethod
+	def get_portfolio_sharpe_ratio_qs(
+			daily_returns: pd.Series,
+			risk_free_rate: Union[float, pd.Series] = 0.03
+			) -> float:
+		"""使用QuantStats计算夏普比率"""
+		if len(daily_returns) < 50:
+			return 0.0
+		
+		try:
+			if HAS_QUANTSTATS:
+				result = qs.stats.sharpe(daily_returns, rf=risk_free_rate)
+				return round(float(result), 4)
+			elif HAS_EMPYRICAL:
+				result = emp.sharpe_ratio(daily_returns, risk_free=risk_free_rate)
+				return round(float(result), 4)
+			else:
+				# 备用手工计算
+				return StockMetrics._manual_sharpe_ratio(daily_returns, risk_free_rate)
+		except Exception as e:
+			logger.warning(f"QuantStats夏普比率计算失败: {e}，使用备用方法")
+			return StockMetrics._manual_sharpe_ratio(daily_returns, risk_free_rate)
+	
+	@staticmethod
+	def get_portfolio_sortino_ratio_qs(
+			daily_returns: pd.Series,
+			risk_free_rate: Union[float, pd.Series] = 0.03
+			) -> float:
+		"""使用QuantStats计算索提诺比率"""
+		if len(daily_returns) < 50:
+			return 0.0
+		
+		try:
+			if HAS_QUANTSTATS:
+				result = qs.stats.sortino(daily_returns, rf=risk_free_rate)
+				return round(float(result), 4)
+			elif HAS_EMPYRICAL:
+				result = emp.sortino_ratio(daily_returns, required_return=risk_free_rate)
+				return round(float(result), 4)
+			else:
+				return StockMetrics._manual_sortino_ratio(daily_returns, risk_free_rate)
+		except Exception as e:
+			logger.warning(f"QuantStats索提诺比率计算失败: {e}，使用备用方法")
+			return StockMetrics._manual_sortino_ratio(daily_returns, risk_free_rate)
+	
+	@staticmethod
+	def get_portfolio_max_drawdown_qs(daily_returns: pd.Series) -> Dict[str, any]:
+		"""使用QuantStats计算最大回撤"""
+		if len(daily_returns) < 50:
+			return {
+				'max_drawdown': 0.0,
+				'drawdown_start_date': None,
+				'drawdown_end_date': None,
+				'recovery_date': None,
+				'duration_days': 0
+				}
+		
+		try:
+			if HAS_QUANTSTATS:
+				# QuantStats计算最大回撤
+				max_dd = qs.stats.max_drawdown(daily_returns)
+				max_drawdown_value = round(float(max_dd) * 100, 2)
+				
+				# 计算详细的回撤信息
+				drawdown_details = StockMetrics._calculate_drawdown_details_qs(daily_returns)
+				drawdown_details['max_drawdown'] = max_drawdown_value
+				
+				return drawdown_details
+			elif HAS_EMPYRICAL:
+				max_dd = emp.max_drawdown(daily_returns)
+				max_drawdown_value = round(float(max_dd) * 100, 2)
+				drawdown_details = StockMetrics._calculate_drawdown_details_qs(daily_returns)
+				drawdown_details['max_drawdown'] = max_drawdown_value
+				return drawdown_details
+			else:
+				return StockMetrics._manual_max_drawdown(daily_returns)
+		except Exception as e:
+			logger.warning(f"QuantStats最大回撤计算失败: {e}，使用备用方法")
+			return StockMetrics._manual_max_drawdown(daily_returns)
+	
+	@staticmethod
+	def get_portfolio_volatility_qs(daily_returns: pd.Series) -> float:
+		"""使用QuantStats计算波动率"""
+		if len(daily_returns) < 50:
+			return 0.0
+		
+		try:
+			if HAS_QUANTSTATS:
+				result = qs.stats.volatility(daily_returns)
+				return round(float(result) * 100, 2)
+			elif HAS_EMPYRICAL:
+				result = emp.annual_volatility(daily_returns)
+				return round(float(result) * 100, 2)
+			else:
+				return round(daily_returns.std() * np.sqrt(252) * 100, 2)
+		except Exception as e:
+			logger.warning(f"QuantStats波动率计算失败: {e}，使用备用方法")
+			return round(daily_returns.std() * np.sqrt(252) * 100, 2)
+	
+	@staticmethod
+	def get_portfolio_beta_qs(
+			daily_returns: pd.Series,
+			benchmark_returns: Optional[pd.Series] = None
+			) -> float:
+		"""使用QuantStats计算Beta系数"""
+		if benchmark_returns is None or benchmark_returns.empty or len(daily_returns) < 50:
+			return 0.0
+		
+		try:
+			# 对齐数据
+			aligned_data = pd.DataFrame({
+				'portfolio': daily_returns,
+				'benchmark': benchmark_returns
+				}).dropna()
+			
+			if len(aligned_data) < 50:
+				return 0.0
+			
+			if HAS_EMPYRICAL:
+				result = emp.beta(aligned_data['portfolio'], aligned_data['benchmark'])
+				return round(float(result), 4)
+			else:
+				# 手工计算Beta
+				covariance = np.cov(aligned_data['portfolio'], aligned_data['benchmark'])[0, 1]
+				benchmark_variance = np.var(aligned_data['benchmark'])
+				return round(covariance / benchmark_variance if benchmark_variance > 0 else 0.0, 4)
+		except Exception as e:
+			logger.warning(f"Beta计算失败: {e}")
+			return 0.0
+	
+	@staticmethod
+	def get_portfolio_var_qs(daily_returns: pd.Series, confidence: float = 0.05) -> float:
+		"""使用QuantStats计算VaR（Value at Risk）"""
+		if len(daily_returns) < 50:
+			return 0.0
+		
+		try:
+			if HAS_QUANTSTATS:
+				result = qs.stats.var(daily_returns, confidence=confidence)
+				return round(float(result) * 100, 2)
+			else:
+				# 手工计算VaR
+				return round(float(daily_returns.quantile(confidence)) * 100, 2)
+		except Exception as e:
+			logger.warning(f"VaR计算失败: {e}")
+			return 0.0
+	
+	@staticmethod
+	def get_portfolio_cvar_qs(daily_returns: pd.Series, confidence: float = 0.05) -> float:
+		"""使用QuantStats计算CVaR（Conditional Value at Risk）"""
+		if len(daily_returns) < 50:
+			return 0.0
+		
+		try:
+			if HAS_QUANTSTATS:
+				result = qs.stats.cvar(daily_returns, confidence=confidence)
+				return round(float(result) * 100, 2)
+			else:
+				# 手工计算CVaR
+				var_threshold = daily_returns.quantile(confidence)
+				cvar = daily_returns[daily_returns <= var_threshold].mean()
+				return round(float(cvar) * 100, 2)
+		except Exception as e:
+			logger.warning(f"CVaR计算失败: {e}")
+			return 0.0
+	
+	@staticmethod
+	def get_portfolio_calmar_ratio_qs(daily_returns: pd.Series) -> float:
+		"""使用QuantStats计算卡尔玛比率"""
+		if len(daily_returns) < 50:
+			return 0.0
+		
+		try:
+			if HAS_QUANTSTATS:
+				result = qs.stats.calmar(daily_returns)
+				return round(float(result), 4)
+			else:
+				# 手工计算：年化收益率 / 最大回撤
+				annual_return = (1 + daily_returns).cumprod().iloc[-1] ** (252 / len(daily_returns)) - 1
+				cumulative = (1 + daily_returns).cumprod()
+				max_dd = ((cumulative.cummax() - cumulative) / cumulative.cummax()).max()
+				return round(annual_return / max_dd if max_dd > 0 else 0.0, 4)
+		except Exception as e:
+			logger.warning(f"卡尔玛比率计算失败: {e}")
+			return 0.0
+	
+	@staticmethod
+	def _calculate_drawdown_details_qs(daily_returns: pd.Series) -> Dict[str, any]:
+		"""计算详细的回撤信息"""
+		try:
+			# 计算累计收益和回撤
+			cumulative = (1 + daily_returns).cumprod()
+			rolling_max = cumulative.cummax()
+			drawdown = (cumulative - rolling_max) / rolling_max
+			
+			# 最大回撤日期
+			drawdown_end_date = drawdown.idxmin()
+			
+			# 回撤开始日期
+			drawdown_start_date = rolling_max.loc[:drawdown_end_date].idxmax()
+			
+			# 恢复日期
+			recovery_date = None
+			peak_value = rolling_max.loc[drawdown_start_date]
+			
+			for date in cumulative.loc[drawdown_end_date:].index:
+				if cumulative.loc[date] >= peak_value:
+					recovery_date = date
+					break
+			
+			# 计算持续时间
+			if recovery_date:
+				duration_days = (recovery_date - drawdown_start_date).days
+			else:
+				duration_days = (cumulative.index[-1] - drawdown_start_date).days
+			
+			return {
+				'drawdown_start_date': drawdown_start_date,
+				'drawdown_end_date': drawdown_end_date,
+				'recovery_date': recovery_date,
+				'duration_days': duration_days
+				}
+		except Exception as e:
+			logger.warning(f"回撤详情计算失败: {e}")
+			return {
+				'drawdown_start_date': None,
+				'drawdown_end_date': None,
+				'recovery_date': None,
+				'duration_days': 0
+				}
+	
+	# ===== 备用手工计算方法 =====
+	@staticmethod
+	def _manual_sharpe_ratio(daily_returns: pd.Series, risk_free_rate: float) -> float:
+		"""备用的手工夏普比率计算"""
+		try:
+			daily_rf = risk_free_rate / 252
+			excess_returns = daily_returns - daily_rf
+			if excess_returns.std() == 0:
+				return 0.0
+			sharpe = (excess_returns.mean() / excess_returns.std()) * np.sqrt(252)
+			return round(sharpe, 4)
+		except:
+			return 0.0
+	
+	@staticmethod
+	def _manual_sortino_ratio(daily_returns: pd.Series, risk_free_rate: float) -> float:
+		"""备用的手工索提诺比率计算"""
+		try:
+			annual_return = daily_returns.mean() * 252
+			annual_excess_return = annual_return - risk_free_rate
+			negative_returns = daily_returns[daily_returns < 0]
+			if len(negative_returns) == 0:
+				return 999.99
+			downside_volatility = negative_returns.std() * np.sqrt(252)
+			if downside_volatility == 0:
+				return 0.0
+			sortino = annual_excess_return / downside_volatility
+			return round(sortino, 4)
+		except:
+			return 0.0
+	
+	@staticmethod
+	def _manual_max_drawdown(daily_returns: pd.Series) -> Dict[str, any]:
+		"""备用的手工最大回撤计算"""
+		try:
+			cumulative = (1 + daily_returns).cumprod()
+			rolling_max = cumulative.cummax()
+			drawdown = (cumulative - rolling_max) / rolling_max
+			max_drawdown = drawdown.min() * 100
+			
+			return {
+				'max_drawdown': round(max_drawdown, 2),
+				'drawdown_start_date': None,
+				'drawdown_end_date': None,
+				'recovery_date': None,
+				'duration_days': 0
+				}
+		except:
+			return {
+				'max_drawdown': 0.0,
+				'drawdown_start_date': None,
+				'drawdown_end_date': None,
+				'recovery_date': None,
+				'duration_days': 0
+				}
+	
+	# ===== 保持原有的辅助方法 =====
 	@staticmethod
 	def _get_empty_metrics() -> Dict[str, any]:
 		"""返回空的指标字典"""
@@ -203,12 +485,12 @@ class StockMetrics:
 			'recovery_date': None,
 			'drawdown_duration_days': 0,
 			'volatility': 0.0,
-			'herfindahl_index': 0.0,
-			'effective_number_stocks': 0.0,
-			'annualized_return': 0.0,
-			'total_return': 0.0,
+			'var_95': 0.0,
+			'cvar_95': 0.0,
+			'calmar_ratio': 0.0,
 			'total_trading_days': 0,
-			'latest_update_date': None
+			'latest_update_date': None,
+			'calculation_method': 'Empty'
 			}
 	
 	@staticmethod
@@ -224,16 +506,7 @@ class StockMetrics:
 			transactions_df: pd.DataFrame,
 			price_df: pd.DataFrame
 			) -> pd.DataFrame:
-		"""
-        构建每日持仓表和权重表（向量化）
-
-        Parameters:
-        transactions_df: columns=['trade_time', 'stock_symbol', 'quantity', 'price']
-        price_df: columns=['datetime', 'stock_symbol', 'close']
-
-        Returns:
-        每日持仓DataFrame
-        """
+		"""构建每日持仓表和权重表（保持原有逻辑）"""
 		if transactions_df.empty or price_df.empty:
 			return pd.DataFrame()
 		
@@ -244,7 +517,7 @@ class StockMetrics:
 		transactions_df['trade_time'] = pd.to_datetime(transactions_df['trade_time'])
 		price_df['datetime'] = pd.to_datetime(price_df['datetime'])
 		
-		# 1️⃣ 累计交易数量
+		# 累计交易数量
 		transactions_df['trade_date'] = transactions_df['trade_time'].dt.floor('D')
 		daily_qty = (
 			transactions_df
@@ -256,7 +529,7 @@ class StockMetrics:
 		if daily_qty.empty:
 			return pd.DataFrame()
 		
-		# 2️⃣ 创建完整日期×股票表
+		# 创建完整日期×股票表
 		all_dates = pd.date_range(
 			daily_qty['trade_date'].min(),
 			daily_qty['trade_date'].max(),
@@ -271,11 +544,11 @@ class StockMetrics:
 			full_index, fill_value=0
 			)
 		
-		# 3️⃣ 累计持仓
+		# 累计持仓
 		daily_positions['quantity'] = daily_positions['quantity'].groupby(level=1).cumsum()
 		daily_positions = daily_positions.reset_index()
 		
-		# 4️⃣ 对齐价格（merge_asof）
+		# 对齐价格
 		price_df_sorted = price_df.sort_values('datetime')
 		daily_positions_sorted = daily_positions.sort_values('datetime')
 		daily_positions_merged = pd.merge_asof(
@@ -293,12 +566,12 @@ class StockMetrics:
 		if daily_positions_merged.empty:
 			return pd.DataFrame()
 		
-		# 5️⃣ 计算每日市值
+		# 计算每日市值
 		daily_positions_merged['market_value'] = (
 				daily_positions_merged['quantity'] * daily_positions_merged['close']
 		)
 		
-		# 6️⃣ 计算每日总市值与权重
+		# 计算每日总市值与权重
 		daily_total_value = (
 			daily_positions_merged
 			.groupby('datetime')['market_value']
@@ -323,49 +596,32 @@ class StockMetrics:
 			lookback_days: Optional[int] = None
 			) -> pd.Series:
 		"""
-		正确计算每日组合收益率 - 基于持仓权重
+		计算每日组合收益率 - 修复版本（使用向量化操作）
 		"""
-		daily_positions = StockMetrics._build_daily_positions(
-		    transactions_df, price_df
-		)
+		daily_positions = StockMetrics._build_daily_positions(transactions_df, price_df)
 		
 		if daily_positions.empty:
-		    return pd.Series()
+			return pd.Series()
 		
-		# 按日期分组
-		daily_returns = []
-		dates = sorted(daily_positions['datetime'].unique())
+		# 计算每日组合总价值
+		daily_portfolio_value = (
+			daily_positions
+			.groupby('datetime')['market_value']
+			.sum()
+			.sort_index()
+		)
 		
-		for i, date in enumerate(dates):
-		    if i == 0:
-		        continue  # 第一天没有收益率
-		        
-		    prev_date = dates[i-1]
-		    
-		    # 获取前一日持仓
-		    prev_positions = daily_positions[daily_positions['datetime'] == prev_date]
-		    curr_positions = daily_positions[daily_positions['datetime'] == date]
-		    
-		    # 计算组合收益率 = Σ(权重i × 股票i收益率)
-		    portfolio_return = 0
-		    prev_total_value = prev_positions['market_value'].sum()
-		    
-		    for _, prev_pos in prev_positions.iterrows():
-		        symbol = prev_pos['stock_symbol']
-		        prev_value = prev_pos['market_value']
-		        weight = prev_value / prev_total_value
-		        
-		        # 计算该股票的收益率
-		        prev_price = prev_pos['close']
-		        curr_price = price_df.loc[date, symbol] if date in price_df.index else prev_price
-		        stock_return = (curr_price - prev_price) / prev_price
-		        
-		        portfolio_return += weight * stock_return
-		    
-		    daily_returns.append(portfolio_return)
+		# 计算收益率
+		portfolio_returns = daily_portfolio_value.pct_change().dropna()
 		
-		return pd.Series(daily_returns, index=dates[1:])
+		# 应用lookback限制
+		if lookback_days and not portfolio_returns.empty:
+			cutoff_date = portfolio_returns.index[-1] - pd.Timedelta(days=lookback_days)
+			portfolio_returns = portfolio_returns[portfolio_returns.index >= cutoff_date]
+		
+		return portfolio_returns
 	
+	# ===== 保持兼容性的旧方法名 =====
 	@staticmethod
 	def get_portfolio_sharpe_ratio(
 			transactions_df: pd.DataFrame,
@@ -373,110 +629,9 @@ class StockMetrics:
 			risk_free_rate: Union[float, pd.Series] = 0.03,
 			lookback_days: int = 252
 			) -> float:
-		"""
-        计算组合夏普比率（年化）
-        """
-		daily_returns = StockMetrics._get_portfolio_daily_returns(
-			transactions_df, price_df, lookback_days
-			)
-		
-		if len(daily_returns) < 50:
-			return 0.0
-		
-		# 计算年化超额收益和夏普比率
-		# 智能处理风险利率类型
-		if isinstance(risk_free_rate, pd.Series):
-			# 输入是每日风险利率序列
-			aligned_risk_free = risk_free_rate.reindex(daily_returns.index, method='ffill').fillna(0)
-			excess_return = daily_returns - aligned_risk_free
-		elif isinstance(risk_free_rate, (int, float)):
-			# 输入是年化风险利率，转换为日利率
-			daily_risk_free_rate = risk_free_rate / 252
-			excess_return = daily_returns - daily_risk_free_rate
-		else:
-			raise ValueError("risk_free_rate must be float or pd.Series")
-		
-		if excess_return.std() == 0:
-			return 0.0
-		
-		sharpe_ratio = (excess_return.mean() / excess_return.std()) * np.sqrt(252)
-		return round(sharpe_ratio, 2)
-	
-	@staticmethod
-	def get_portfolio_max_drawdown(
-			transactions_df: pd.DataFrame,
-			price_df: pd.DataFrame,
-			lookback_days: int = 252
-			) -> Dict[str, any]:
-		"""
-        计算组合最大回撤信息
-        """
-		daily_returns = StockMetrics._get_portfolio_daily_returns(
-			transactions_df, price_df, lookback_days
-			)
-		
-		if len(daily_returns) < 50:
-			return {
-				'max_drawdown': 0.0,
-				'drawdown_start_date': None,
-				'drawdown_end_date': None,
-				'recovery_date': None,
-				'duration_days': 0
-				}
-		
-		# 计算累计收益和回撤
-		cumulative = (1 + daily_returns).cumprod()
-		rolling_max = cumulative.cummax()
-		drawdown = (cumulative - rolling_max) / rolling_max
-		
-		# 最大回撤值和日期
-		max_drawdown = drawdown.min() * 100
-		drawdown_end_date = drawdown.idxmin()
-		
-		# 回撤开始日期（最近的历史高点）
-		drawdown_start_date = rolling_max.loc[:drawdown_end_date].idxmax()
-		
-		# 恢复日期（回撤后第一次创新高的日期）
-		recovery_date = None
-		peak_value = rolling_max.loc[drawdown_start_date]
-		
-		for date in cumulative.loc[drawdown_end_date:].index:
-			if cumulative.loc[date] >= peak_value:
-				recovery_date = date
-				break
-		
-		# 计算持续时间
-		if recovery_date:
-			duration_days = (recovery_date - drawdown_start_date).days
-		else:
-			duration_days = (cumulative.index[-1] - drawdown_start_date).days
-		
-		return {
-			'max_drawdown': round(max_drawdown, 2),
-			'drawdown_start_date': drawdown_start_date,
-			'drawdown_end_date': drawdown_end_date,
-			'recovery_date': recovery_date,
-			'duration_days': duration_days
-			}
-	
-	@staticmethod
-	def get_portfolio_volatility(
-			transactions_df: pd.DataFrame,
-			price_df: pd.DataFrame,
-			lookback_days: int = 252
-			) -> float:
-		"""
-        计算组合年化波动率（按252交易日计算）
-        """
-		daily_returns = StockMetrics._get_portfolio_daily_returns(
-			transactions_df, price_df, lookback_days
-			)
-		
-		if len(daily_returns) < 50:
-			return 0.0
-		
-		volatility = daily_returns.std() * np.sqrt(252) * 100
-		return round(volatility, 2)
+		"""保持兼容性的夏普比率计算（内部调用QuantStats版本）"""
+		daily_returns = StockMetrics._get_portfolio_daily_returns(transactions_df, price_df, lookback_days)
+		return StockMetrics.get_portfolio_sharpe_ratio_qs(daily_returns, risk_free_rate)
 	
 	@staticmethod
 	def get_portfolio_sortino_ratio(
@@ -485,44 +640,29 @@ class StockMetrics:
 			risk_free_rate: Union[float, pd.Series] = 0.03,
 			lookback_days: int = 252
 			) -> float:
-		"""
-        计算组合索提诺比率
-        """
-		daily_returns = StockMetrics._get_portfolio_daily_returns(
-			transactions_df, price_df, lookback_days
-			)
-		
-		if len(daily_returns) < 50:
-			return 0.0
-		
-		# 计算年化收益率
-		# 智能处理风险利率类型
-		if isinstance(risk_free_rate, pd.Series):
-			# 使用每日风险利率计算年化超额收益
-			aligned_risk_free = risk_free_rate.reindex(daily_returns.index, method='ffill').fillna(0)
-			excess_return = daily_returns - aligned_risk_free
-			annual_excess_return = excess_return.mean() * 252
-		elif isinstance(risk_free_rate, (int, float)):
-			# 使用年化风险利率
-			annual_return = daily_returns.mean() * 252
-			annual_excess_return = annual_return - risk_free_rate
-		else:
-			raise ValueError("risk_free_rate must be float or pd.Series")
-		
-		# 计算下行波动率（只考虑负收益）
-		negative_returns = daily_returns[daily_returns < 0]
-		
-		if len(negative_returns) == 0:
-			return 999.99
-		
-		downside_volatility = negative_returns.std() * np.sqrt(252)
-		
-		if downside_volatility == 0:
-			return 0.0
-		
-		# 计算索提诺比率
-		sortino_ratio = annual_excess_return / downside_volatility
-		return round(sortino_ratio, 2)
+		"""保持兼容性的索提诺比率计算"""
+		daily_returns = StockMetrics._get_portfolio_daily_returns(transactions_df, price_df, lookback_days)
+		return StockMetrics.get_portfolio_sortino_ratio_qs(daily_returns, risk_free_rate)
+	
+	@staticmethod
+	def get_portfolio_max_drawdown(
+			transactions_df: pd.DataFrame,
+			price_df: pd.DataFrame,
+			lookback_days: int = 252
+			) -> Dict[str, any]:
+		"""保持兼容性的最大回撤计算"""
+		daily_returns = StockMetrics._get_portfolio_daily_returns(transactions_df, price_df, lookback_days)
+		return StockMetrics.get_portfolio_max_drawdown_qs(daily_returns)
+	
+	@staticmethod
+	def get_portfolio_volatility(
+			transactions_df: pd.DataFrame,
+			price_df: pd.DataFrame,
+			lookback_days: int = 252
+			) -> float:
+		"""保持兼容性的波动率计算"""
+		daily_returns = StockMetrics._get_portfolio_daily_returns(transactions_df, price_df, lookback_days)
+		return StockMetrics.get_portfolio_volatility_qs(daily_returns)
 	
 	@staticmethod
 	def get_daily_positions(
@@ -530,12 +670,8 @@ class StockMetrics:
 			price_df: pd.DataFrame,
 			lookback_days: Optional[int] = None
 			) -> pd.DataFrame:
-		"""
-        获取每日持仓和权重表
-        """
-		daily_positions = StockMetrics._build_daily_positions(
-			transactions_df, price_df
-			)
+		"""获取每日持仓和权重表"""
+		daily_positions = StockMetrics._build_daily_positions(transactions_df, price_df)
 		
 		if lookback_days and not daily_positions.empty:
 			latest_date = daily_positions['datetime'].max()
